@@ -17,13 +17,17 @@ def saveStack(ims, fname):
     for i in range(ims.shape[-1]):
         skimage.io.imsave('{0}_{1:0>3}.png'.format(fname, i), ims[:, :, i])
 
-ims = skimage.io.imread_collection('/home/bbales2/virt/segmentation/UCSB_Rene88DT_FIBSS/BSEhigh/out/aligned/output/BSE1_aligned_*.png')
-ims = ims.concatenate()[60:112]
+ims = skimage.io.imread_collection('/home/bbales2/virt/ch/gpu2/out0/*.png')
+ims = ims.concatenate()[0:36]
 ims = numpy.rollaxis(ims, 0, 3)
+
+ns = skimage.io.imread_collection('/home/bbales2/virt/ch/input/*.png')
+ns = ns.concatenate()[0:36]
+ns = numpy.rollaxis(ns, 0, 3)
 
 ims2 = []
 for i in range(ims.shape[2]):
-    ims2.append(scipy.misc.imresize(ims[:, :, i], 0.5))
+    ims2.append(scipy.misc.imresize(ims[:, :, i], 1.0))
     
 ims2 = numpy.array(ims2)
 ims2 = numpy.rollaxis(ims2, 0, 3)
@@ -43,7 +47,7 @@ def rescale(signal, minimum, maximum):
 
 print "Setting up constants"
 pr = 'float32'
-signal = 1.0 - rescale(ims2, 0.0, 1.0).astype(pr)
+signal = rescale(ims2, 0.0, 1.0).astype(pr)
 
 Wx = 2.0 * numpy.pi * numpy.fft.fftfreq(signal.shape[0], 1.0).astype(pr)
 Wy = 2.0 * numpy.pi * numpy.fft.fftfreq(signal.shape[1], 1.0).astype(pr)
@@ -58,13 +62,16 @@ wx2 = wx2.astype(pr)
 wy2 = wy2.astype(pr)
 wz2 = wz2.astype(pr)
 
-b0 = numpy.float32(905.387)
-b2 = numpy.float32(211.611)
-b3 = numpy.float32(-165.031)
-b4 = numpy.float32(135.637)
 
 c1 = numpy.float32(0.125)
 c2 = numpy.float32(0.383)
+
+b0 = numpy.float32(905.387)
+b3 = numpy.float32(-165.031)
+b4 = numpy.float32((100.0) / 3.0)
+b4p = numpy.float32((35.637) / 9.0)
+#b2 = 211.611
+b2 = numpy.float32((-(1.0 / 3.0) * b3 -b4 -3 * b4p) / (c2 - 0.24))
 
 c11 = numpy.float32(2.31)
 c12 = numpy.float32(1.09)
@@ -138,33 +145,49 @@ print "Building Cuda..."
 pycuda.driver.init()
 context = pycuda.tools.make_default_context()
 
-def dfdc(c, n):
-    return b0 * (c - c1) - 0.5 * b2 * n * n
+#def dfdc(c, n):
+#    return b0 * (c - c1) - 0.5 * b2 * n * n
 
-def dfdn(c, n):
-    return b2 * (c2 - c) * n + b3 * n * n + b4 * n * n * n
+#def dfdn(c, n):
+#    return b2 * (c2 - c) * n + b3 * n * n + b4 * n * n * n
+
+def dfdc(c, n1, n2, n3):
+    return b0 * (c - c1) - 0.5 * b2 * (n1 ** 2 + n2 ** 2 + n3 ** 2)
+
+def dfdn1(c, n1, n2, n3):
+    return b2 * (c2 - c) * n1 + (1.0 / 3.0) * b3 * n2 * n3 + b4 * n1**3 + b4p * (n1**2 + n2**2 + n3**2) * n1
+
+def dfdn2(c, n1, n2, n3):
+    return b2 * (c2 - c) * n2 + (1.0 / 3.0) * b3 * n1 * n3 + b4 * n2**3 + b4p * (n1**2 + n2**2 + n3**2) * n2
+
+def dfdn3(c, n1, n2, n3):
+    return b2 * (c2 - c) * n3 + (1.0 / 3.0) * b3 * n1 * n2 + b4 * n3**3 + b4p * (n1**2 + n2**2 + n3**2) * n3
 
 mod = pycuda.compiler.SourceModule("""
 #include <cuComplex.h>
 
-__global__ void dfdc(float scaleFact, float b0, float c1, float b2, cuComplex *c, cuComplex *n, cuComplex *z)
+__global__ void dfdc(float scaleFact, float b0, float c1, float b2, cuComplex *c, cuComplex *n1, cuComplex *n2, cuComplex *n3, cuComplex *z)
 {
   const int i = ((blockIdx.x + blockIdx.y * gridDim.x) * blockDim.x) + threadIdx.x;
-  float cv = scaleFact * c[i].x; 
-  float nv = scaleFact * n[i].x; 
+  float cv = scaleFact * c[i].x;
+  float nv1 = scaleFact * n1[i].x;
+  float nv2 = scaleFact * n2[i].x;
+  float nv3 = scaleFact * n3[i].x;
 
-  z[i] = make_cuFloatComplex(b0 * (cv - c1) - 0.5 * b2 * nv * nv, 0.0);
+  z[i] = make_cuFloatComplex(b0 * (cv - c1) - 0.5 * b2 * (nv1 * nv1 + nv2 * nv2 + nv3 * nv3), 0.0);
 }
 
-__global__ void dfdn(float scaleFact, float b2, float c2, float b3, float b4, cuComplex *c, cuComplex *n, cuComplex *z)
+__global__ void dfdn(float scaleFact, float b2, float c2, float b3, float b4, float b4p, cuComplex *c, cuComplex *n1, cuComplex *n2, cuComplex *n3, cuComplex *z)
 {
 //
   const int i = ((blockIdx.x + blockIdx.y * gridDim.x) * blockDim.x) + threadIdx.x;
 
   float cv = scaleFact * c[i].x; 
-  float nv = scaleFact * n[i].x; 
+  float nv1 = scaleFact * n1[i].x; 
+  float nv2 = scaleFact * n2[i].x; 
+  float nv3 = scaleFact * n3[i].x; 
 
-  z[i] = make_cuFloatComplex(b2 * (c2 - cv) * nv + b3 * nv * nv + b4 * nv * nv * nv, 0.0);
+  z[i] = make_cuFloatComplex(b2 * (c2 - cv) * nv1 + (1.0 / 3.0) * b3 * nv2 * nv3 + b4 * nv1 * nv1 * nv1 + b4p * (nv1 * nv1 + nv2 * nv2 + nv3 * nv3) * nv1, 0.0);
 }
 
 __global__ void nupdate(float dt, float sig1, float *wx, float *wy, float *wz, cuComplex *dfdn, cuComplex *n)
@@ -239,26 +262,51 @@ c0update = mod.get_function("c0update")
 fdeupdate = mod.get_function("fdeupdate")
 cupdate = mod.get_function("cupdate")
 
-c = scipy.fftpack.fftn(rescale(signal, 0.1, 0.14))
-n = scipy.fftpack.fftn(rescale(signal, 0.0, 1.0))
+c = scipy.fftpack.fftn(rescale(signal, 0.125, 0.24))
+n1 = numpy.zeros(signal.shape).astype('complex64')
+n2 = numpy.zeros(signal.shape).astype('complex64')
+n3 = numpy.zeros(signal.shape).astype('complex64')
 
-dt = numpy.float32(0.1e-3)
+options = sorted(list(set(ns.flatten())))
+
+lookup = dict([(opt, i) for i, opt in enumerate(options)])
+factors = [[0, 0, 0], [1, 1, 1], [-1, -1, 1], [-1, 1, -1], [1, -1, -1]]
+
+for i in range(0, signal.shape[0]):
+    for j in range(0, signal.shape[1]):
+        for k in range(0, signal.shape[2]):
+            n1v, n2v, n3v = factors[lookup[ns[i, j, k]]]
+        
+            n1[i, j, k] = n1v
+            n2[i, j, k] = n2v
+            n3[i, j, k] = n3v
+
+n1 = scipy.fftpack.fftn(n1)
+n2 = scipy.fftpack.fftn(n2)
+n3 = scipy.fftpack.fftn(n3)
+
+dt = numpy.float32(0.5e-3)
 
 sig1 = numpy.float32(5.0)
 sig2 = numpy.float32(-50.0)
 
 chi = numpy.float32(0.4)
-mu = numpy.float32(1773.0)
+mu = numpy.float32(1273.0)
 
 c0real = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
-n0real = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
 
-dfdn_ = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
+dfdn1_ = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
+dfdn2_ = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
+dfdn3_ = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
 dfdc_ = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
 
 innerx = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
 innery = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
 innerz = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
+
+n1real = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
+n2real = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
+n3real = pycuda.gpuarray.GPUArray(signal.shape, dtype=numpy.complex64)
 
 gV = pycuda.gpuarray.to_gpu(V.astype('complex64'))
 
@@ -267,8 +315,10 @@ gwy = pycuda.gpuarray.to_gpu(wy)
 gwz = pycuda.gpuarray.to_gpu(wz)
 
 gc = pycuda.gpuarray.to_gpu(c)
-gn = pycuda.gpuarray.to_gpu(n)
-tmp2 = pycuda.gpuarray.to_gpu(n)
+gn1 = pycuda.gpuarray.to_gpu(n1)
+gn2 = pycuda.gpuarray.to_gpu(n2)
+gn3 = pycuda.gpuarray.to_gpu(n3)
+tmp2 = pycuda.gpuarray.to_gpu(n1)
 
 plan = scikits.cuda.fft.Plan(signal.shape, numpy.complex64, numpy.complex64)
 
@@ -284,30 +334,54 @@ print "Starting execution"
 starttime = time.time()
 steps = 1001
 for t in range(0, steps):
-    n0real = innerx
     scikits.cuda.fft.ifft(gc, c0real, plan)
-    scikits.cuda.fft.ifft(gn, n0real, plan)
+    scikits.cuda.fft.ifft(gn1, n1real, plan)
+    scikits.cuda.fft.ifft(gn2, n2real, plan)
+    scikits.cuda.fft.ifft(gn3, n3real, plan)
     #c0real = numpy.real(scipy.fftpack.ifftn(c0))
     #n0real = numpy.real(scipy.fftpack.ifftn(n0))
-    dfdn(scaleFact, b2, c2, b3, b4, c0real, n0real, dfdn_, block = threads, grid = blockDim)
-    dfdc(scaleFact, b0, c1, b2, c0real, n0real, dfdc_, block = threads, grid = blockDim)
+    dfdn(scaleFact, b2, c2, b3, b4, b4p, c0real, n1real, n2real, n3real, dfdn1_, block = threads, grid = blockDim)
+    dfdn(scaleFact, b2, c2, b3, b4, b4p, c0real, n2real, n1real, n3real, dfdn2_, block = threads, grid = blockDim)
+    dfdn(scaleFact, b2, c2, b3, b4, b4p, c0real, n3real, n1real, n2real, dfdn3_, block = threads, grid = blockDim)
+    dfdc(scaleFact, b0, c1, b2, c0real, n1real, n2real, n3real, dfdc_, block = threads, grid = blockDim)
     #print numpy.imag(dfdc_.get()[1, 1, 0:10])
     #print numpy.fft.ifftn(gc.get())[1, 0, 0]
     #print b2, c2, b3, b4, numpy.real(dfdn_.get())[1, 0, 0], numpy.real(c0real.get())[1, 0, 0], numpy.real(n0real.get())[1, 0, 0]
-    scikits.cuda.fft.fft(dfdn_, dfdn_, plan)
+    scikits.cuda.fft.fft(dfdn1_, dfdn1_, plan)
+    scikits.cuda.fft.fft(dfdn2_, dfdn2_, plan)
+    scikits.cuda.fft.fft(dfdn3_, dfdn3_, plan)
     scikits.cuda.fft.fft(dfdc_, dfdc_, plan)
 
-    if t % 250 == 0:
+    if t % 50 == 0:
         scikits.cuda.fft.ifft(gc, tmp2, plan)
         c = rescale(numpy.real(tmp2.get()), 0.0, 1.0)
-        saveStack(c, 'gpu3/out{0}/out{0}'.format(t))
+        saveStack(c, 'gpu4/out{0}/out{0}'.format(t))
+
+        scikits.cuda.fft.ifft(gn1, tmp2, plan)
+        c = rescale(numpy.abs(numpy.real(tmp2.get())), 0.0, 1.0)
+        threshold = skimage.filters.threshold_otsu(c)
+        out = c >= threshold
+        saveStack(out * 1.0, 'gpu5/seg{0}/out{0}'.format(t))
+
+        #mark = mahotas.labeled.borders((c >= threshold))
+
+        #scikits.cuda.fft.ifft(gn2, tmp2, plan)
+        #c = rescale(numpy.real(tmp2.get()), 0.0, 1.0)
+        #saveStack(c, 'gpu4/outn2{0}/out{0}'.format(t))
+
+        #scikits.cuda.fft.ifft(gn3, tmp2, plan)
+        #c = rescale(numpy.real(tmp2.get()), 0.0, 1.0)
+        #saveStack(c, 'gpu4/outn3{0}/out{0}'.format(t))
 
     #print gc.get()[:5, 0, 0]
     #print gn.get()[:4, 0, 0]
     #print '----------'
     #n = n0 - dt * (sig1 * (wx2 + wy2 + wz2) * n0 + dfdn_)
-    nupdate(dt, sig1, gwx, gwy, gwz, dfdn_, gn, block = threads, grid = blockDim)
+    nupdate(dt, sig1, gwx, gwy, gwz, dfdn1_, gn1, block = threads, grid = blockDim)
+    nupdate(dt, sig1, gwx, gwy, gwz, dfdn2_, gn2, block = threads, grid = blockDim)
+    nupdate(dt, sig1, gwx, gwy, gwz, dfdn3_, gn3, block = threads, grid = blockDim)
     fdeupdate(mu, sig2, gV, gc, gwx, gwy, gwz, dfdc_, innerx, innery, innerz, block = threads, grid = blockDim)
+
     #print gV.get()[1, 1, 1], gc.get()[1, 1, 1], gwx.get()[1, 1, 1], gwy.get()[1, 1, 1], gwz.get()[1, 1, 1]
     scikits.cuda.fft.ifft(innerx, innerx, plan)
     scikits.cuda.fft.ifft(innery, innery, plan)
@@ -331,12 +405,12 @@ for t in range(0, steps):
     #print gn.get()[1, 1, 1]
 print "Time per cycle: ", (time.time() - starttime) / float(steps)
 
-scikits.cuda.fft.ifft(gn, tmp2, plan)
-c = rescale(numpy.real(tmp2.get()), 0.0, 1.0)
+scikits.cuda.fft.ifft(gn1, tmp2, plan)
+c = rescale(numpy.abs(numpy.real(tmp2.get())), 0.0, 1.0)
 
 threshold = skimage.filters.threshold_otsu(c)
 out = c >= threshold
-saveStack(out * 1.0, 'gpu3/seg{0}/seg{0}'.format(t))
+saveStack(out * 1.0, 'gpu5/seg{0}/seg{0}'.format(t))
 mark = mahotas.labeled.borders((c >= threshold))
 
 context.pop()
